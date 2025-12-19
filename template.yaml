@@ -1,0 +1,648 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Smart Expense Tracker with Receipt OCR - Serverless Application
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.11
+    MemorySize: 256
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        LOG_LEVEL: INFO
+        USERS_TABLE: !Ref UsersTable
+        EXPENSES_TABLE: !Ref ExpensesTable
+        BUDGETS_TABLE: !Ref BudgetsTable
+        RECEIPTS_TABLE: !Ref ReceiptsTable
+        RECEIPTS_BUCKET: !Ref ReceiptsBucket
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
+        SES_SENDER_EMAIL: !Ref SenderEmail
+        TEXTRACT_CONFIDENCE_THRESHOLD: 80
+        COMPREHEND_CONFIDENCE_THRESHOLD: 70
+    Layers:
+      - !Ref DependenciesLayer
+    Tracing: Active
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+    Auth:
+      DefaultAuthorizer: CognitoAuthorizer
+      Authorizers:
+        CognitoAuthorizer:
+          UserPoolArn: !GetAtt UserPool.Arn
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  SenderEmail:
+    Type: String
+    Description: Email address for sending reports (must be verified in SES)
+    Default: noreply@example.com
+
+Resources:
+  # ===== Lambda Layers =====
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-dependencies
+      Description: Python dependencies for expense tracker
+      ContentUri: dependencies/
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.11
+
+  # ===== Cognito User Pool =====
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ===== DynamoDB Tables =====
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-expenses
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: expense_id
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: expense_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: user-date-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: user-category-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: category
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  BudgetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-budgets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: budget_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: budget_id
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReceiptsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-receipts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: receipt_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: receipt_id
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== S3 Bucket =====
+  ReceiptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-receipts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReceipts
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention
+            NoncurrentVersionExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedHeaders:
+              - '*'
+            MaxAge: 3000
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt OCRProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: receipts/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReceiptsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReceiptsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub ${ReceiptsBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+
+  # ===== Lambda Functions =====
+
+  # Auth Function
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-auth
+      CodeUri: src/auth/
+      Handler: handler.lambda_handler
+      Description: Handle authentication (register, login, refresh)
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:SignUp
+                - cognito-idp:InitiateAuth
+                - cognito-idp:AdminGetUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        Register:
+          Type: Api
+          Properties:
+            Path: /auth/register
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        Login:
+          Type: Api
+          Properties:
+            Path: /auth/login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        Refresh:
+          Type: Api
+          Properties:
+            Path: /auth/refresh
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  # Receipt Upload Function
+  ReceiptUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-receipt-upload
+      CodeUri: src/receipts/
+      Handler: handler.lambda_handler
+      Description: Handle receipt uploads and listing
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReceiptsTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReceiptsBucket
+      Events:
+        Upload:
+          Type: Api
+          Properties:
+            Path: /receipts/upload
+            Method: POST
+        List:
+          Type: Api
+          Properties:
+            Path: /receipts
+            Method: GET
+        GetReceipt:
+          Type: Api
+          Properties:
+            Path: /receipts/{id}
+            Method: GET
+        DeleteReceipt:
+          Type: Api
+          Properties:
+            Path: /receipts/{id}
+            Method: DELETE
+
+  # OCR Processor Function
+  OCRProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ocr-processor
+      CodeUri: src/ocr_processor/
+      Handler: handler.lambda_handler
+      Description: Process receipts with Textract and Comprehend
+      MemorySize: 1024
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReceiptsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReceiptsBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - textract:AnalyzeExpense
+                - textract:DetectDocumentText
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - comprehend:DetectEntities
+                - comprehend:ClassifyDocument
+              Resource: '*'
+
+  OCRProcessorFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OCRProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ReceiptsBucket.Arn
+
+  # Expense Function
+  ExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-expense
+      CodeUri: src/expenses/
+      Handler: handler.lambda_handler
+      Description: Handle expense CRUD operations
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReceiptsBucket
+      Events:
+        List:
+          Type: Api
+          Properties:
+            Path: /expenses
+            Method: GET
+        Get:
+          Type: Api
+          Properties:
+            Path: /expenses/{id}
+            Method: GET
+        Update:
+          Type: Api
+          Properties:
+            Path: /expenses/{id}
+            Method: PUT
+        Delete:
+          Type: Api
+          Properties:
+            Path: /expenses/{id}
+            Method: DELETE
+        Summary:
+          Type: Api
+          Properties:
+            Path: /expenses/summary
+            Method: GET
+
+  # Budget Function
+  BudgetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-budget
+      CodeUri: src/budgets/
+      Handler: handler.lambda_handler
+      Description: Handle budget management and alerts
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        Create:
+          Type: Api
+          Properties:
+            Path: /budgets
+            Method: POST
+        List:
+          Type: Api
+          Properties:
+            Path: /budgets
+            Method: GET
+        Update:
+          Type: Api
+          Properties:
+            Path: /budgets/{id}
+            Method: PUT
+        Delete:
+          Type: Api
+          Properties:
+            Path: /budgets/{id}
+            Method: DELETE
+
+  # Report Function
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-report
+      CodeUri: src/reports/
+      Handler: handler.lambda_handler
+      Description: Generate and email reports
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BudgetsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        Monthly:
+          Type: Api
+          Properties:
+            Path: /reports/monthly
+            Method: GET
+        Weekly:
+          Type: Api
+          Properties:
+            Path: /reports/weekly
+            Method: GET
+        Email:
+          Type: Api
+          Properties:
+            Path: /reports/email
+            Method: POST
+        Export:
+          Type: Api
+          Properties:
+            Path: /reports/export
+            Method: GET
+
+  # ===== Application Insights =====
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub ApplicationInsights-SAM-${AWS::StackName}
+      ResourceQuery:
+        Type: CLOUDFORMATION_STACK_1_0
+
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName: !Ref ApplicationResourceGroup
+      AutoConfigurationEnabled: true
+
+Outputs:
+  # API Gateway
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiUrl
+
+  # Cognito
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  # DynamoDB Tables
+  UsersTableName:
+    Description: DynamoDB Users Table Name
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub ${AWS::StackName}-UsersTable
+
+  ExpensesTableName:
+    Description: DynamoDB Expenses Table Name
+    Value: !Ref ExpensesTable
+    Export:
+      Name: !Sub ${AWS::StackName}-ExpensesTable
+
+  BudgetsTableName:
+    Description: DynamoDB Budgets Table Name
+    Value: !Ref BudgetsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-BudgetsTable
+
+  ReceiptsTableName:
+    Description: DynamoDB Receipts Table Name
+    Value: !Ref ReceiptsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-ReceiptsTable
+
+  # S3 Bucket
+  ReceiptsBucketName:
+    Description: S3 Bucket for Receipts
+    Value: !Ref ReceiptsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ReceiptsBucket
+
+  # Lambda Functions
+  AuthFunctionArn:
+    Description: Auth Lambda Function ARN
+    Value: !GetAtt AuthFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-AuthFunctionArn
+
+  ReceiptUploadFunctionArn:
+    Description: Receipt Upload Lambda Function ARN
+    Value: !GetAtt ReceiptUploadFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ReceiptUploadFunctionArn
+
+  OCRProcessorFunctionArn:
+    Description: OCR Processor Lambda Function ARN
+    Value: !GetAtt OCRProcessorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-OCRProcessorFunctionArn
+
+  ExpenseFunctionArn:
+    Description: Expense Lambda Function ARN
+    Value: !GetAtt ExpenseFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ExpenseFunctionArn
+
+  BudgetFunctionArn:
+    Description: Budget Lambda Function ARN
+    Value: !GetAtt BudgetFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-BudgetFunctionArn
+
+  ReportFunctionArn:
+    Description: Report Lambda Function ARN
+    Value: !GetAtt ReportFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ReportFunctionArn
